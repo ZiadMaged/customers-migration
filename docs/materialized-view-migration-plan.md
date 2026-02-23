@@ -33,7 +33,7 @@ TARGET (Materialized View):
 │  (SQLite)    │          │  (REST API)  │
 └──────┬───────┘          └──────┬───────┘
        │                         │
-       │  CDC (Debezium)         │  Webhook / Polling Connector
+       │  CDC (Debezium)         │  Polling Connector
        │                         │
        ▼                         ▼
 ┌──────────────────────────────────────────┐
@@ -281,55 +281,38 @@ export class SystemAPollerService implements OnModuleInit {
 
 ### Phase 3: Change Data Capture — System B (Week 3-4)
 
-#### 3.3.1 Webhook Listener (Preferred)
+#### 3.3.1 Polling-Based Event Producer
 
-If System B supports webhooks:
-
-```typescript
-// src/infrastructure/kafka/producers/system-b-webhook.controller.ts
-@Controller('webhooks/system-b')
-export class SystemBWebhookController {
-  constructor(private readonly kafkaProducer: KafkaProducerService) {}
-
-  @Post('customer-changed')
-  @HttpCode(200)
-  async handleCustomerChange(
-    @Body() event: SystemBWebhookPayload,
-    @Headers('x-webhook-signature') signature: string,
-  ): Promise<void> {
-    // Verify webhook signature (HMAC-SHA256)
-    this.verifySignature(event, signature);
-
-    await this.kafkaProducer.send({
-      topic: 'customer.changes.system-b',
-      messages: [{
-        key: event.email,
-        value: JSON.stringify({
-          eventId: event.eventId ?? randomUUID(),
-          source: 'system_b',
-          operation: event.type,
-          timestamp: event.occurredAt,
-          payload: event.customer,
-        }),
-      }],
-    });
-  }
-}
-```
-
-#### 3.3.2 Polling Fallback
-
-If System B doesn't support webhooks, poll the API:
+System B is an external REST API we do not control, so we use a **polling-based approach** to detect changes and publish them as events to Kafka. The poller queries System B for records updated since the last poll cycle and produces a change event for each modified customer.
 
 ```typescript
 // src/infrastructure/kafka/producers/system-b-poller.service.ts
 @Injectable()
-export class SystemBPollerService {
-  @Cron('*/5 * * * *')  // Every 5 min
+export class SystemBPollerService implements OnModuleInit {
+  private lastPolledAt: Date = new Date(0);
+
+  constructor(
+    private readonly httpService: HttpService,
+    private readonly kafkaProducer: KafkaProducerService,
+    private readonly logger: Logger,
+  ) {}
+
+  onModuleInit(): void {
+    // On startup, initialize from the last known checkpoint (persisted in Redis/DB)
+    // to avoid re-processing the full history after a restart.
+    this.loadCheckpoint();
+  }
+
+  @Cron('*/5 * * * *')  // Every 5 minutes
   async pollChanges(): Promise<void> {
     const response = await this.httpService
-      .get('/customers', { params: { updatedSince: this.lastPolledAt } })
+      .get('/customers', { params: { updatedSince: this.lastPolledAt.toISOString() } })
       .toPromise();
+
+    if (!response.data.length) {
+      this.logger.debug('System B poll: no changes since ' + this.lastPolledAt.toISOString());
+      return;
+    }
 
     for (const customer of response.data) {
       await this.kafkaProducer.send({
@@ -348,9 +331,48 @@ export class SystemBPollerService {
     }
 
     this.lastPolledAt = new Date();
+    await this.saveCheckpoint(this.lastPolledAt);
+
+    this.logger.log(`System B poll: published ${response.data.length} change events`);
+  }
+
+  private async loadCheckpoint(): Promise<void> {
+    // Load last poll timestamp from Redis or database to survive restarts
+    const saved = await this.checkpointStore.get('system-b-poller');
+    if (saved) this.lastPolledAt = new Date(saved);
+  }
+
+  private async saveCheckpoint(timestamp: Date): Promise<void> {
+    await this.checkpointStore.set('system-b-poller', timestamp.toISOString());
   }
 }
 ```
+
+#### 3.3.2 Event Schema (System B)
+
+```typescript
+interface SystemBChangeEvent {
+  eventId: string;          // UUID — idempotency key
+  source: 'system_b';
+  operation: 'CREATE' | 'UPDATE' | 'DELETE';
+  timestamp: string;        // ISO 8601
+  payload: {
+    email: string;          // Partition key
+    uuid: string;
+    name: string;
+    address: string;
+    phone: string | null;
+    lastUpdated: string;
+  };
+}
+```
+
+#### 3.3.3 Design Considerations
+
+- **Why polling over webhooks:** System B is an external API we do not control. We cannot guarantee webhook support, endpoint registration, or signature verification. Polling keeps the integration entirely within our boundary and avoids a dependency on System B's notification infrastructure.
+- **Poll interval:** 5 minutes balances freshness against API rate limits. Since System B updates near-real-time but our materialized view tolerates sub-minute staleness, this is acceptable. The interval can be tuned via configuration.
+- **Checkpoint persistence:** The `lastPolledAt` timestamp is persisted to Redis so that restarts do not trigger a full re-poll. On first boot (no checkpoint), the poller processes all records as an implicit backfill.
+- **Idempotency:** Each event carries a `randomUUID()` as its `eventId`. The downstream sync worker deduplicates via the Redis-backed `DeduplicationStore` (see Phase 4).
 
 ---
 
@@ -770,7 +792,7 @@ The current read-time merge code remains in the codebase throughout migration an
 |-------|-------------|----------|-------------|
 | 1 | Infrastructure setup (Kafka, PostgreSQL, Redis) | 2 weeks | DevOps approval |
 | 2 | System A CDC / polling producer | 1 week | Phase 1 |
-| 3 | System B webhook/polling producer | 1 week | Phase 1 |
+| 3 | System B polling producer | 1 week | Phase 1 |
 | 4 | Sync worker (consumer + merge + MV write) | 2 weeks | Phase 2, 3 |
 | 5 | API migration + shadow validation | 1 week | Phase 4 + backfill |
 | 6 | Monitoring, alerting, Grafana dashboards | 1 week | Phase 4 |
