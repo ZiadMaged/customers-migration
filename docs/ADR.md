@@ -1,7 +1,5 @@
 # ADR-001: Unified Customer Service Architecture
 
-**Status:** Accepted  
-**Date:** 2025-02-22  
 **Decision Makers:** Engineering Team
 
 ---
@@ -130,4 +128,5 @@ Implemented via a global `ResponseWrapperInterceptor` (success path) and `AllExc
 
 ### Risks
 - If System B response format changes, the `CustomerBMapper` breaks — mitigated by strict typing and E2E tests
+
 - SQLite is not suitable for production concurrency — the infrastructure layer can be swapped to PostgreSQL without touching domain/application code
