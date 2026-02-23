@@ -69,45 +69,6 @@ Coordinator  ──→  Prepare(A)  ──→  Prepare(B)  ──→  Commit(A) 
 
 **Verdict:** 2PC is unsuitable for this use case. System B is an external service, and the priority is availability over strict consistency.
 
-### Option 3: Saga Pattern (Choreography or Orchestration)
-
-```
-Update System A  ──→  Event: "A updated"  ──→  Update System B  ──→  Event: "B updated"
-                                                   │ (failure)
-                                                   └──→  Compensating action on A
-```
-
-**Trade-offs:**
-- ✅ No distributed locks — each step is a local transaction.
-- ✅ Compensating actions handle partial failures gracefully.
-- ⚠️ More complex — requires tracking saga state and designing compensations for each step.
-- ⚠️ Temporarily inconsistent between steps (but bounded inconsistency window).
-
-**When to use:** If we need write-back and System B supports an update API, a saga with an orchestrator service is the cleanest approach.
-
----
-
-## Idempotency Considerations
-
-For any write-back mechanism, idempotency is critical:
-
-1. **Version vector / `lastUpdated` comparison:** Before applying an update, compare the event's timestamp with the target system's current `lastUpdated`. Skip if stale.
-2. **Idempotency keys:** Each sync event carries a unique ID. The worker tracks processed IDs (in Redis or a deduplication table) to prevent double-application.
-3. **Optimistic concurrency:** Use ETag or version columns in System A. If the row changed between read and write, retry with the latest version.
-
-```typescript
-// Pseudocode for idempotent sync
-async applySync(event: SyncEvent): Promise<void> {
-  if (await this.dedup.hasProcessed(event.id)) return; // Already done
-
-  const current = await systemA.findByEmail(event.email);
-  if (current.lastUpdated >= event.timestamp) return;   // Stale event
-
-  await systemA.update(event.email, event.changes);
-  await this.dedup.markProcessed(event.id);
-}
-```
-
 ---
 
 ## Monitoring & Observability
@@ -136,3 +97,4 @@ An **alert** on `sync.partial_results.total` sustained above threshold indicates
 | 2PC | Strong | Low | High | ❌ Not feasible |
 
 The current implementation is deliberately simple — it maximizes availability and demonstrates the merge semantics. The path to stronger consistency is well-defined and incremental: add CDC, add Kafka, add a sync worker. Each step is additive, not a rewrite.
+
